@@ -25,9 +25,11 @@
 (async () => {
   const CATOID = 46;      // 2026-27 undergraduate catalog (was 44 = 2025-26)
   const NAVOID = 4715;    // the "Courses" list page for that catalog
-  const DELAY_MS = 500;   // polite gap between pages (dodges the 202 throttle)
-  const MAX_PAGES = 50;   // safety cap; loop also self-stops on repeat/empty
+  const DELAY_MS = 900;   // base gap between pages; jittered below (dodges 202)
+  const MAX_PAGES = 50;   // safety cap; loop also self-stops when no new courses
+  const MAX_RETRY = 6;    // per-page retries on the 202 throttle
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const jitter = () => DELAY_MS + Math.floor(Math.random() * 500); // 900-1400ms
 
   // prefix -> department name, for the index. Derived from the catalog's
   // "Course Type" dropdown. Unknown prefixes fall back to the raw prefix.
@@ -78,53 +80,75 @@
     return "/content.php?" + p.toString();
   };
 
+  // regex for a course-code header line: "CSCI 1100 - Intro..." -> "CSCI 1100"
+  const CODE = /^([A-Z]{2,4})\s?(\d{3,4}[A-Z]?)\s*[-–]\s*(.+)$/;
+  const codesIn = (text) => {
+    const out = [];
+    for (const line of text.split("\n")) {
+      const m = line.trim().match(CODE);
+      if (m) out.push(`${m[1]} ${m[2]}`);
+    }
+    return out;
+  };
+
   // fetch one page, retrying on 202 / empty (the bot-throttle response) --------
+  // Key lesson: res.ok is TRUE for 202, so "ok" does NOT mean "got data".
+  // We check the body length, and back off longer each retry.
   async function fetchPage(cpage) {
-    for (let attempt = 0; attempt < 4; attempt++) {
-      const res = await fetch(urlFor(cpage), { credentials: "same-origin" });
-      const html = await res.text();
-      if (res.ok && html.length > 300) return html;   // real page
-      say(`Page ${cpage}: throttled (HTTP ${res.status}), backing off...`);
-      await sleep(1500 * (attempt + 1));                // 1.5s, 3s, 4.5s...
+    for (let attempt = 0; attempt < MAX_RETRY; attempt++) {
+      let res, html = "";
+      try { res = await fetch(urlFor(cpage), { credentials: "same-origin" }); html = await res.text(); }
+      catch (e) { /* network hiccup, treat as retryable */ }
+      if (res && res.ok && html.length > 300) return html;   // real page
+      const wait = 2500 * (attempt + 1);                     // 2.5s,5s,7.5s...15s
+      say(`Page ${cpage}: throttled (HTTP ${res ? res.status : "err"}), waiting ${wait / 1000}s (try ${attempt + 1}/${MAX_RETRY})...`);
+      await sleep(wait);
     }
     return null;
   }
 
-  // ---- pull every page, keep the cleaned text of the content cell -----------
+  // ---- pull every page; stop when a page adds no NEW course codes ------------
   const parts = [];
-  let prevKey = "", pages = 0;
+  const seen = new Set();     // every course code seen so far (the real end signal)
+  let pages = 0;
   for (let cp = 1; cp <= MAX_PAGES; cp++) {
-    const html = await fetchPage(cp);
-    if (!html) { say(`Stopping: page ${cp} would not load.`); break; }
+    let html = await fetchPage(cp);
+    if (!html) {                                  // one long cooldown, then quit
+      say(`Page ${cp} blocked. One 25s cooldown, then a final try...`);
+      await sleep(25000);
+      html = await fetchPage(cp);
+      if (!html) { say(`Stopping at page ${cp}: still blocked after cooldown. Keeping the ${seen.size} courses gathered so far.`); break; }
+    }
     const doc = new DOMParser().parseFromString(html, "text/html");
     const main = doc.querySelector("td.block_content") || doc.body;
-    // drop the search form, its helper table, scripts/styles
     main.querySelectorAll("form, table.nounderlines, script, style").forEach((e) => e.remove());
-    // replace course links with their plain text (kills the tracking URLs,
-    // keeps "CSCI 1100 - Intro..." as readable text)
     main.querySelectorAll('a[href*="preview_course"]').forEach((a) => {
       a.replaceWith(document.createTextNode(a.textContent));
     });
     const text = main.innerText.replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
-    const key = text.slice(0, 150);
-    if (!text || key === prevKey) { say(`Reached the end at page ${cp}.`); break; }
-    prevKey = key; pages = cp; parts.push(text);
-    say(`Fetched page ${cp} (${text.length.toLocaleString()} chars). Total pages so far: ${pages}.`);
-    await sleep(DELAY_MS);
+
+    const codes = codesIn(text);
+    const fresh = codes.filter((c) => !seen.has(c));
+    if (codes.length === 0) { say(`Reached the end at page ${cp} (no courses on it).`); break; }
+    if (fresh.length === 0) { say(`Reached the end at page ${cp} (no NEW courses; catalog wrapped).`); break; }
+    fresh.forEach((c) => seen.add(c));
+    parts.push(text); pages = cp;
+    say(`Page ${cp}: ${codes.length} courses (${fresh.length} new). Running total: ${seen.size}.`);
+    await sleep(jitter());
   }
   const raw = parts.join("\n\n");
 
   // ---- parse the text into course records -----------------------------------
   // A title line looks like:  "CSCI 1100 - Introduction to Computer Science"
-  // Everything until the next title line is that course's body.
-  const CODE = /^([A-Z]{2,4})\s?(\d{3,4}[A-Z]?)\s*[-–]\s*(.+)$/;
-  const courses = [];
+  // Everything until the next title line is that course's body. (CODE regex
+  // was defined up top and reused here.)
+  const parsed = [];
   let cur = null;
   for (const line of raw.split("\n")) {
     const t = line.trim();
     const m = t.match(CODE);
     if (m) {
-      if (cur) courses.push(cur);
+      if (cur) parsed.push(cur);
       cur = { code: `${m[1]} ${m[2]}`, prefix: m[1], number: m[2], title: m[3].trim(),
               prereq: "", credits: "", fdr: "", description: "" };
     } else if (cur && t) {
@@ -134,7 +158,11 @@
       else                               cur.description += (cur.description ? " " : "") + t;
     }
   }
-  if (cur) courses.push(cur);
+  if (cur) parsed.push(cur);
+  // de-dup by code (a page can carry a few already-seen codes), keep first seen
+  const courses = [];
+  const dseen = new Set();
+  for (const c of parsed) { if (!dseen.has(c.code)) { dseen.add(c.code); courses.push(c); } }
 
   // ---- build clean markdown, grouped by department, with an index -----------
   const byDept = {};
