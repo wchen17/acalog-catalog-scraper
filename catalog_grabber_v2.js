@@ -140,29 +140,61 @@
 
   // ---- parse the text into course records -----------------------------------
   // A title line looks like:  "CSCI 1100 - Introduction to Computer Science"
-  // Everything until the next title line is that course's body. (CODE regex
-  // was defined up top and reused here.)
+  // The catalog's expanded view renders each course as ONE line with the fields
+  // run together (no newlines), e.g.:
+  //   "Data Structures   Prerequisite: CSCI 1100  FDR: ...(SC)Credits: 4This..."
+  // So we can't split by line; we split the blob AFTER "CODE - " on the inline
+  // "Prerequisite" / "FDR:" / "Credits:" markers (in that catalog order).
+  function splitFields(blob) {
+    const iPre = blob.indexOf("Prerequisite");
+    const iFdr = blob.indexOf("FDR:");
+    const iCred = blob.indexOf("Credits:");
+    // only trust a Prerequisite marker sitting BEFORE Credits (else it's prose)
+    const pPre = (iPre !== -1 && iCred !== -1 && iPre > iCred) ? -1 : iPre;
+    const marks = [pPre, iFdr, iCred].filter((x) => x !== -1);
+    const title = (marks.length ? blob.slice(0, Math.min(...marks)) : blob).trim();
+    let prereq = "", fdr = "", credits = "", description = "";
+    if (pPre !== -1) {
+      const ends = [iFdr, iCred].filter((x) => x !== -1 && x > pPre);
+      const e = ends.length ? Math.min(...ends) : blob.length;
+      prereq = blob.slice(pPre, e).replace(/^Prerequisite[s]?:?\s*/, "").trim();
+    }
+    if (iFdr !== -1) {
+      const ends = [iCred].filter((x) => x !== -1 && x > iFdr);
+      const e = ends.length ? Math.min(...ends) : blob.length;
+      fdr = blob.slice(iFdr + 4, e).trim();
+    }
+    if (iCred !== -1) {
+      const after = blob.slice(iCred + 8).replace(/^\s+/, "");
+      const m = after.match(/^([0-9]+(?:\s*-\s*[0-9]+)?)/);   // credits, maybe a range
+      if (m) { credits = m[1]; description = after.slice(m[0].length).trim(); }
+      else description = after.trim();
+    }
+    return { title, prereq, fdr, credits, description };
+  }
+
   const parsed = [];
   let cur = null;
   for (const line of raw.split("\n")) {
     const t = line.trim();
+    if (!t) continue;
     const m = t.match(CODE);
-    if (m) {
+    if (m) {                                   // new course starts
       if (cur) parsed.push(cur);
-      cur = { code: `${m[1]} ${m[2]}`, prefix: m[1], number: m[2], title: m[3].trim(),
-              prereq: "", credits: "", fdr: "", description: "" };
-    } else if (cur && t) {
-      if (/^Prerequisite/i.test(t))      cur.prereq += (cur.prereq ? " " : "") + t.replace(/^Prerequisite[s]?:?\s*/i, "");
-      else if (/^Credits?:/i.test(t))    cur.credits = t.replace(/^Credits?:?\s*/i, "");
-      else if (/^(FDR|Fulfills)/i.test(t)) cur.fdr   = t.replace(/^(FDR|Fulfills)[:\s]*/i, "");
-      else                               cur.description += (cur.description ? " " : "") + t;
+      cur = { code: `${m[1]} ${m[2]}`, prefix: m[1], number: m[2], blob: m[3].trim() };
+    } else if (cur) {                          // rare wrapped line: fold into blob
+      cur.blob += " " + t;
     }
   }
   if (cur) parsed.push(cur);
-  // de-dup by code (a page can carry a few already-seen codes), keep first seen
+  // split fields + de-dup by code (a page can carry a few already-seen codes)
   const courses = [];
   const dseen = new Set();
-  for (const c of parsed) { if (!dseen.has(c.code)) { dseen.add(c.code); courses.push(c); } }
+  for (const c of parsed) {
+    if (dseen.has(c.code)) continue;
+    dseen.add(c.code);
+    courses.push({ code: c.code, prefix: c.prefix, number: c.number, ...splitFields(c.blob) });
+  }
 
   // ---- build clean markdown, grouped by department, with an index -----------
   const byDept = {};
